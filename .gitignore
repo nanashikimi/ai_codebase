@@ -1,0 +1,22 @@
+# build
+bin/
+dist/
+*.log
+
+# local data / docker volumes
+qdrant_data/
+openwebui_data/
+data/
+*.db
+*.sqlite
+.env
+
+# ide
+.idea/
+.vscode/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+EOF
