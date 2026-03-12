@@ -50,6 +50,11 @@ func SearchCode(req SearchCodeRequest) (SearchCodeResponse, error) {
 		"--glob", "!**/dist/*",
 		"--glob", "!**/build/*",
 		"--glob", "!**/.venv/*",
+		"--glob", "!internal/agent/*",
+		"--glob", "!prompts/*",
+		"--glob", "!examples/*",
+		"--glob", "!README.md",
+		"--glob", "!scripts/*",
 		q,
 	}
 	cmd := exec.Command("rg", args...)
