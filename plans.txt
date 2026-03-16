@@ -1,0 +1,7 @@
+1. MCP-style tool registry endpoint exposing tool schemas
+2. Dedicated prompt layer separating prompts from agent logic
+3. Explicit LLM workflows for retrieval and tool reasoning
+4. OpenAI-compatible API adapter for external integrations
+5. Full Open WebUI integration for interactive repository exploration
+6. Smoke tests for grounded LLM answer regression checks
+7. Future semantic search / RAG with embeddings and vector DB

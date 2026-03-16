@@ -72,16 +72,7 @@ func NewDefaultAgent(model string) *Agent {
 }
 
 func (a *Agent) Chat(question string) (string, error) {
-	system := `You are an AI Codebase Copilot.
-
-Rules:
-- Use tools to inspect repository code.
-- Prefer search_code first, then open_file if needed.
-- Do NOT invent file paths or line numbers.
-- Never call open_file on a path that was not returned by search_code.
-- If search_code returns no hits twice, answer exactly: No matches found in the repository.
-- Final answers must include at least one real path:line citation from tool outputs.`
-
+	system := SystemPrompt
 	messages := []Message{
 		{Role: "system", Content: system},
 		{Role: "user", Content: question},
@@ -192,12 +183,12 @@ Rules:
 			if toolRounds >= 2 {
 				messages = append(messages, Message{
 					Role:    "system",
-					Content: "You now have enough context. Do not call any more tools. Answer using only the citations above.",
+					Content: NoMoreToolsPrompt,
 				})
 			} else {
 				messages = append(messages, Message{
 					Role:    "user",
-					Content: "If you need more context, call one more tool. Otherwise answer now using only the citations above.",
+					Content: OneMoreToolOrAnswerPrompt,
 				})
 			}
 
@@ -230,11 +221,8 @@ Rules:
 			}
 
 			messages = append(messages, Message{
-				Role: "user",
-				Content: "Your last answer was not grounded enough. " +
-					"Answer again using ONLY the citations above. " +
-					"Include at least one real path:line citation. " +
-					"If you cannot answer from the tool outputs, answer exactly: No matches found in the repository.",
+				Role:    "user",
+				Content: RetryGroundedAnswerPrompt,
 			})
 			continue
 		}
@@ -261,7 +249,7 @@ Rules:
 
 		messages = append(messages, Message{
 			Role:    "user",
-			Content: "FINAL ANSWER NOW. Use ONLY the citations above and include at least one real path:line citation.",
+			Content: FinalAnswerNowPrompt,
 		})
 	}
 
@@ -517,309 +505,4 @@ func makeOpenFileToolDef() ToolDef {
 		"required": []string{"path"},
 	}
 	return t
-}
-
-func (a *Agent) generateSearchQuery(question string) (string, error) {
-	messages := []Message{
-		{
-			Role: "system",
-			Content: `You generate ripgrep search queries for code repositories.
-
-Rules:
-- Return ONLY code identifiers or short regex alternations.
-- Do NOT include explanations.
-- Do NOT include words like "line", "number", or "file".
-- Prefer function names, endpoints, handlers, and server-related symbols.
-
-Examples:
-Question: Where is the HTTP server started?
-Query: ListenAndServe|http\.ListenAndServe
-
-Question: Where are HTTP handlers registered?
-Query: HandleFunc|ServeHTTP
-
-Question: Where is search_code implemented?
-Query: SearchCode|search_code
-
-Question: Where is /chat handled?
-Query: /chat|HandleFunc|ServeHTTP
-
-Return ONLY the query.`,
-		},
-		{
-			Role:    "user",
-			Content: question,
-		},
-	}
-
-	resp, err := a.callOllama(messages, nil)
-	if err != nil {
-		return fallbackSearchQuery(question), nil
-	}
-
-	q := strings.TrimSpace(resp.Message.Content)
-	q = strings.Trim(q, "`")
-	q = strings.Trim(q, `"`)
-	q = strings.ReplaceAll(q, "\n", " ")
-	q = strings.TrimSpace(q)
-
-	if strings.Contains(strings.ToLower(q), "line") ||
-		strings.Contains(strings.ToLower(q), "number") ||
-		strings.Contains(strings.ToLower(q), "file") ||
-		q == "" {
-		return fallbackSearchQuery(question), nil
-	}
-
-	log.Printf("generated search query: %s", q)
-	return q, nil
-}
-
-func fallbackSearchQuery(question string) string {
-	q := strings.ToLower(question)
-
-	if strings.Contains(q, "/chat") {
-		return `/chat|HandleFunc|ServeHTTP`
-	}
-	if strings.Contains(q, "handler") {
-		return `HandleFunc|http\.HandleFunc|ServeHTTP`
-	}
-	if strings.Contains(q, "http server") || strings.Contains(q, "server") || strings.Contains(q, "started") {
-		return `ListenAndServe|http\.ListenAndServe|http\.Server`
-	}
-	if strings.Contains(q, "search_code") {
-		return `SearchCode|search_code`
-	}
-	if strings.Contains(q, "open_file") {
-		return `OpenFile|open_file`
-	}
-
-	return `ListenAndServe|HandleFunc|ServeHTTP`
-}
-
-func appendToolSummary(messages *[]Message, toolName string, toolJSON string) {
-	switch toolName {
-	case "search_code":
-		var r tools.SearchCodeResponse
-		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
-			*messages = append(*messages, Message{
-				Role:    "user",
-				Content: "CITATIONS: (failed to parse search_code output)",
-			})
-			return
-		}
-		if len(r.Hits) == 0 {
-			*messages = append(*messages, Message{
-				Role:    "user",
-				Content: "CITATIONS: (search_code returned 0 hits)",
-			})
-			return
-		}
-
-		max := 8
-		if len(r.Hits) < max {
-			max = len(r.Hits)
-		}
-
-		var b strings.Builder
-		b.WriteString("CITATIONS (copy these exact path:line):\n")
-		for i := 0; i < max; i++ {
-			h := r.Hits[i]
-			fmt.Fprintf(&b, "- %s:%d  %s\n", h.Path, h.Line, h.Text)
-		}
-
-		*messages = append(*messages, Message{
-			Role:    "user",
-			Content: b.String(),
-		})
-
-	case "open_file":
-		var r tools.OpenFileResponse
-		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
-			*messages = append(*messages, Message{
-				Role:    "user",
-				Content: "OPEN_FILE SNIPPET: (failed to parse open_file output)",
-			})
-			return
-		}
-
-		lines := strings.Split(r.Content, "\n")
-		if len(lines) > 0 && lines[len(lines)-1] == "" {
-			lines = lines[:len(lines)-1]
-		}
-
-		maxLines := 25
-		if len(lines) < maxLines {
-			maxLines = len(lines)
-		}
-
-		var b strings.Builder
-		fmt.Fprintf(&b, "OPEN_FILE SNIPPET (copy exact path:line): %s:%d-%d\n",
-			r.Path, r.StartLine, r.StartLine+maxLines-1)
-
-		for i := 0; i < maxLines; i++ {
-			ln := r.StartLine + i
-			fmt.Fprintf(&b, "%s:%d  %s\n", r.Path, ln, lines[i])
-		}
-
-		if r.Truncated {
-			b.WriteString("(open_file output was truncated)\n")
-		}
-
-		*messages = append(*messages, Message{
-			Role:    "user",
-			Content: b.String(),
-		})
-	}
-}
-
-func looksGrounded(s string) bool {
-	if !strings.Contains(s, ":") {
-		return false
-	}
-
-	return strings.Contains(s, ".go:") ||
-		strings.Contains(s, ".rs:") ||
-		strings.Contains(s, ".py:") ||
-		strings.Contains(s, ".ts:") ||
-		strings.Contains(s, ".js:") ||
-		strings.Contains(s, ".java:") ||
-		strings.Contains(s, ".cpp:") ||
-		strings.Contains(s, ".c:")
-}
-
-func referencesKnownPath(answer string, knownPaths map[string]bool) bool {
-	for p := range knownPaths {
-		if p != "" && strings.Contains(answer, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func isNoMatchesAnswer(s string) bool {
-	t := strings.TrimSpace(strings.ToLower(s))
-	return t == "no matches found" ||
-		t == "no matches found." ||
-		t == "no matches found in the repository." ||
-		t == "no matches found in the repository"
-}
-
-func searchReturnedNoHits(toolJSON string) bool {
-	var r tools.SearchCodeResponse
-	if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
-		return false
-	}
-	return len(r.Hits) == 0
-}
-
-func addKnownPathsFromToolOutput(knownPaths map[string]bool, toolName string, toolJSON string) {
-	switch toolName {
-	case "search_code":
-		var r tools.SearchCodeResponse
-		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
-			return
-		}
-		for _, h := range r.Hits {
-			if h.Path != "" {
-				knownPaths[h.Path] = true
-			}
-		}
-
-	case "open_file":
-		var r tools.OpenFileResponse
-		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
-			return
-		}
-		if r.Path != "" {
-			knownPaths[r.Path] = true
-		}
-	}
-}
-
-func chooseBestHit(hits []tools.SearchHit) *tools.SearchHit {
-	for i := range hits {
-		if strings.Contains(hits[i].Text, "ListenAndServe") {
-			return &hits[i]
-		}
-	}
-
-	for i := range hits {
-		if strings.Contains(hits[i].Text, `"/chat"`) {
-			return &hits[i]
-		}
-	}
-
-	for i := range hits {
-		if strings.HasPrefix(hits[i].Path, "cmd/") {
-			return &hits[i]
-		}
-	}
-
-	for i := range hits {
-		if strings.HasPrefix(hits[i].Path, "internal/agent/") {
-			continue
-		}
-		return &hits[i]
-	}
-
-	if len(hits) > 0 {
-		return &hits[0]
-	}
-	return nil
-}
-
-func conciseNoAnswer() string {
-	return "I could not produce a grounded answer from the retrieved code snippets."
-}
-
-func mapKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-
-func mustJSON(v any) string {
-	b, _ := json.Marshal(v)
-	return string(b)
-}
-
-func getString(m map[string]any, k string) string {
-	v, ok := m[k]
-	if !ok || v == nil {
-		return ""
-	}
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return fmt.Sprint(v)
-}
-
-func getInt(m map[string]any, k string) int {
-	v, ok := m[k]
-	if !ok || v == nil {
-		return 0
-	}
-	switch t := v.(type) {
-	case float64:
-		return int(t)
-	case int:
-		return t
-	default:
-		return 0
-	}
-}
-
-func isScaffoldAnswer(s string) bool { //for 2nd attempt
-	t := strings.TrimSpace(strings.ToLower(s))
-	return strings.HasPrefix(t, "citations") ||
-		strings.HasPrefix(t, "open_file snippet") ||
-		strings.HasPrefix(t, "question:") ||
-		strings.HasPrefix(t, "query:")
-}
-
-func isCitationOnlyAnswer(s string) bool {
-	t := strings.TrimSpace(strings.ToLower(s))
-	return strings.HasPrefix(t, "citations")
 }
