@@ -81,6 +81,74 @@ func appendToolSummary(messages *[]Message, toolName string, toolJSON string) {
 			Role:    "user",
 			Content: b.String(),
 		})
+	case "list_files":
+		var r tools.ListFilesResponse
+		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
+			*messages = append(*messages, Message{
+				Role:    "user",
+				Content: "FILES: (failed to parse list_files output)",
+			})
+			return
+		}
+		if len(r.Files) == 0 {
+			*messages = append(*messages, Message{
+				Role:    "user",
+				Content: "FILES: (list_files returned 0 files)",
+			})
+			return
+		}
+
+		limit := 20
+		if len(r.Files) < limit {
+			limit = len(r.Files)
+		}
+
+		var b strings.Builder
+		b.WriteString("FILES:\n")
+		for i := 0; i < limit; i++ {
+			fmt.Fprintf(&b, "- %s\n", r.Files[i])
+		}
+
+		*messages = append(*messages, Message{
+			Role:    "user",
+			Content: b.String(),
+		})
+
+	case "grep_file":
+		var r tools.GrepFileResponse
+		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
+			*messages = append(*messages, Message{
+				Role:    "user",
+				Content: "GREP_FILE: (failed to parse output)",
+			})
+			return
+		}
+
+		if len(r.Hits) == 0 {
+			*messages = append(*messages, Message{
+				Role:    "user",
+				Content: "GREP_FILE: no matches",
+			})
+			return
+		}
+
+		max := 10
+		if len(r.Hits) < max {
+			max = len(r.Hits)
+		}
+
+		var b strings.Builder
+		fmt.Fprintf(&b, "GREP_FILE (copy path:line): %s\n", r.Path)
+
+		for i := 0; i < max; i++ {
+			h := r.Hits[i]
+			fmt.Fprintf(&b, "%s:%d %s\n", r.Path, h.Line, h.Text)
+		}
+
+		*messages = append(*messages, Message{
+			Role:    "user",
+			Content: b.String(),
+		})
 	}
 }
 
@@ -124,22 +192,79 @@ func isScaffoldAnswer(s string) bool {
 		strings.HasPrefix(t, "query:")
 }
 
+func resolveKnownPath(shortPath string, knownPaths map[string]bool) string {
+	shortPath = strings.TrimSpace(shortPath)
+	if shortPath == "" {
+		return ""
+	}
+
+	if knownPaths[shortPath] {
+		return shortPath
+	}
+
+	var candidates []string
+	for p := range knownPaths {
+		if strings.HasSuffix(p, "/"+shortPath) || p == shortPath {
+			candidates = append(candidates, p)
+		}
+	}
+
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+
+	return ""
+}
+
 func isCitationOnlyAnswer(s string) bool {
 	t := strings.TrimSpace(strings.ToLower(s))
 	return strings.HasPrefix(t, "citations")
 }
 
-func normalizeCitationAnswer(s string) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	if len(lines) <= 1 {
+/*
+	func normalizeCitationAnswer(s string) string {
+		lines := strings.Split(strings.TrimSpace(s), "\n")
+		if len(lines) <= 1 {
+			return s
+		}
+
+		if strings.HasPrefix(strings.ToLower(lines[0]), "citations") {
+			return "Found relevant location:\n" + strings.Join(lines[1:], "\n")
+		}
+
 		return s
 	}
-
-	if strings.HasPrefix(strings.ToLower(lines[0]), "citations") {
-		return "Found relevant location:\n" + strings.Join(lines[1:], "\n")
+*/
+func trivialFinalAnswer(s string) string {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return t
 	}
 
-	return s
+	lower := strings.ToLower(t)
+
+	if strings.HasPrefix(lower, "citations") {
+		lines := strings.Split(t, "\n")
+		clean := make([]string, 0, len(lines))
+
+		for _, line := range lines[1:] {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			clean = append(clean, line)
+		}
+
+		if len(clean) == 1 {
+			return "Found relevant location:\n\n" + clean[0]
+		}
+
+		if len(clean) > 1 {
+			return "Found relevant locations:\n\n" + strings.Join(clean, "\n")
+		}
+	}
+
+	return t
 }
 
 func searchReturnedNoHits(toolJSON string) bool {
@@ -170,6 +295,17 @@ func addKnownPathsFromToolOutput(knownPaths map[string]bool, toolName string, to
 		}
 		if r.Path != "" {
 			knownPaths[r.Path] = true
+		}
+
+	case "list_files":
+		var r tools.ListFilesResponse
+		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
+			return
+		}
+		for _, f := range r.Files {
+			if f != "" {
+				knownPaths[f] = true
+			}
 		}
 	}
 }
@@ -253,4 +389,12 @@ func getInt(m map[string]any, k string) int {
 	default:
 		return 0
 	}
+}
+
+func isFileListAnswer(s string) bool {
+	t := strings.ToLower(strings.TrimSpace(s))
+	return strings.Contains(t, "the following files") ||
+		strings.Contains(t, "contains the following files") ||
+		strings.Contains(t, "files within") ||
+		(strings.Contains(t, ".go") && strings.Contains(t, "internal/"))
 }

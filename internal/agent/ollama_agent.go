@@ -78,9 +78,18 @@ func (a *Agent) Chat(question string) (string, error) {
 		{Role: "user", Content: question},
 	}
 
+	if hint := extraToolHint(question); hint != "" {
+		messages = append(messages, Message{
+			Role:    "user",
+			Content: hint,
+		})
+	}
+
 	toolsDef := []ToolDef{
 		makeSearchToolDef(),
 		makeOpenFileToolDef(),
+		makeListFilesToolDef(),
+		makeGrepFileToolDef(),
 	}
 
 	haveToolContext := false
@@ -88,6 +97,27 @@ func (a *Agent) Chat(question string) (string, error) {
 	zeroHitSearches := 0
 	invalidFinalAnswers := 0
 	knownPaths := map[string]bool{}
+
+	if strings.Contains(question, ".go") ||
+		strings.Contains(question, ".py") ||
+		strings.Contains(question, ".js") ||
+		strings.Contains(question, ".ts") {
+		resp, err := tools.ListFiles(tools.ListFilesRequest{
+			Root:       ".",
+			MaxResults: 200,
+		})
+		if err == nil {
+			out := mustJSON(resp)
+			messages = append(messages, Message{
+				Role:     "tool",
+				ToolName: "list_files",
+				Content:  out,
+			})
+			appendToolSummary(&messages, "list_files", out)
+			addKnownPathsFromToolOutput(knownPaths, "list_files", out)
+			haveToolContext = true
+		}
+	}
 
 	for step := 0; step < 8; step++ {
 		if len(messages) > 12 {
@@ -134,6 +164,14 @@ func (a *Agent) Chat(question string) (string, error) {
 					}
 				}
 
+				if toolName == "grep_file" {
+					path := getString(tc.Function.Arguments, "path")
+					resolved := resolveKnownPath(path, knownPaths)
+					if resolved != "" {
+						tc.Function.Arguments["path"] = resolved
+					}
+				}
+
 				out, err := a.executeTool(toolName, tc.Function.Arguments)
 				if err != nil {
 					out = fmt.Sprintf(`{"error":%q}`, err.Error())
@@ -155,7 +193,7 @@ func (a *Agent) Chat(question string) (string, error) {
 						zeroHitSearches = 0
 						haveToolContext = true
 					}
-				} else if toolName == "open_file" {
+				} else if toolName == "open_file" || toolName == "list_files" || toolName == "grep_file" {
 					haveToolContext = true
 				}
 			}
@@ -207,12 +245,17 @@ func (a *Agent) Chat(question string) (string, error) {
 
 			if isCitationOnlyAnswer(content) && referencesKnownPath(content, knownPaths) {
 				log.Printf("FINAL CITATION ANSWER RETURNED: %s", content)
-				return content, nil
+				return trivialFinalAnswer(content), nil
+			}
+
+			if isFileListAnswer(content) {
+				log.Printf("FINAL CITATION ANSWER RETURNED: %s", content)
+				return trivialFinalAnswer(content), nil
 			}
 
 			if !isScaffoldAnswer(content) && looksGrounded(content) && referencesKnownPath(content, knownPaths) {
 				log.Printf("FINAL ANSWER RETURNED: %s", content)
-				return content, nil
+				return trivialFinalAnswer(content), nil
 			}
 
 			invalidFinalAnswers++
@@ -467,42 +510,30 @@ func (a *Agent) executeTool(name string, args map[string]any) (string, error) {
 		}
 		return mustJSON(resp), nil
 
+	case "list_files":
+		req := tools.ListFilesRequest{
+			Root:       getString(args, "root"),
+			MaxResults: getInt(args, "max_results"),
+		}
+		resp, err := tools.ListFiles(req)
+		if err != nil {
+			return "", err
+		}
+		return mustJSON(resp), nil
+
+	case "grep_file":
+		req := tools.GrepFileRequest{
+			Path:       getString(args, "path"),
+			Query:      getString(args, "query"),
+			MaxResults: getInt(args, "max_results"),
+		}
+		resp, err := tools.GrepFile(req)
+		if err != nil {
+			return "", err
+		}
+		return mustJSON(resp), nil
+
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
-}
-
-func makeSearchToolDef() ToolDef {
-	var t ToolDef
-	t.Type = "function"
-	t.Function.Name = "search_code"
-	t.Function.Description = "Search the repository using ripgrep and return matching lines with file path and line number."
-	t.Function.Parameters = map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"query":       map[string]any{"type": "string", "description": "Search query (ripgrep pattern)."},
-			"root":        map[string]any{"type": "string", "description": "Optional root directory relative to server working dir."},
-			"max_results": map[string]any{"type": "integer", "description": "Max number of hits to return."},
-		},
-		"required": []string{"query"},
-	}
-	return t
-}
-
-func makeOpenFileToolDef() ToolDef {
-	var t ToolDef
-	t.Type = "function"
-	t.Function.Name = "open_file"
-	t.Function.Description = "Open a file and return its contents for a given 1-based line range."
-	t.Function.Parameters = map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"path":       map[string]any{"type": "string", "description": "File path relative to repo root."},
-			"start_line": map[string]any{"type": "integer", "description": "Start line (1-based)."},
-			"end_line":   map[string]any{"type": "integer", "description": "End line (1-based, inclusive)."},
-			"max_chars":  map[string]any{"type": "integer", "description": "Safety limit for returned text size."},
-		},
-		"required": []string{"path"},
-	}
-	return t
 }

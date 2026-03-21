@@ -1,0 +1,159 @@
+package tools
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+func TestListFiles_Basic(t *testing.T) {
+	tmp := t.TempDir()
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWd)
+	}()
+
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+
+	mustMkdirAll(t, filepath.Join("cmd", "mcp-server"))
+	mustWriteFile(t, filepath.Join("cmd", "mcp-server", "main.go"), "package main\n")
+	mustMkdirAll(t, filepath.Join("internal", "tools"))
+	mustWriteFile(t, filepath.Join("internal", "tools", "search_code.go"), "package tools\n")
+	mustWriteFile(t, "README.md", "# test\n")
+
+	resp, err := ListFiles(ListFilesRequest{
+		Root: ".",
+	})
+	if err != nil {
+		t.Fatalf("ListFiles returned error: %v", err)
+	}
+
+	got := resp.Files
+	want := []string{
+		"README.md",
+		"cmd/mcp-server/main.go",
+		"internal/tools/search_code.go",
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected files\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestListFiles_MaxResults(t *testing.T) {
+	tmp := t.TempDir()
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWd)
+	}()
+
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+
+	mustWriteFile(t, "a.go", "package a\n")
+	mustWriteFile(t, "b.go", "package b\n")
+	mustWriteFile(t, "c.go", "package c\n")
+
+	resp, err := ListFiles(ListFilesRequest{
+		Root:       ".",
+		MaxResults: 2,
+	})
+	if err != nil {
+		t.Fatalf("ListFiles returned error: %v", err)
+	}
+
+	if len(resp.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d: %#v", len(resp.Files), resp.Files)
+	}
+}
+
+func TestListFiles_RejectsAbsoluteRoot(t *testing.T) {
+	tmp := t.TempDir()
+
+	_, err := ListFiles(ListFilesRequest{
+		Root: tmp,
+	})
+
+	if err == nil {
+		t.Fatal("expected error for absolute path root, got nil")
+	}
+}
+
+func TestListFiles_RejectsTraversal(t *testing.T) {
+	_, err := ListFiles(ListFilesRequest{
+		Root: "../secret",
+	})
+
+	if err == nil {
+		t.Fatal("expected traversal error, got nil")
+	}
+}
+
+func TestListFiles_SkipsCommonIgnoredDirs(t *testing.T) {
+	tmp := t.TempDir()
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWd)
+	}()
+
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+
+	mustMkdirAll(t, ".git")
+	mustWriteFile(t, filepath.Join(".git", "config"), "x\n")
+
+	mustMkdirAll(t, filepath.Join("node_modules", "pkg"))
+	mustWriteFile(t, filepath.Join("node_modules", "pkg", "index.js"), "x\n")
+
+	mustWriteFile(t, "main.go", "package main\n")
+
+	resp, err := ListFiles(ListFilesRequest{
+		Root: ".",
+	})
+	if err != nil {
+		t.Fatalf("ListFiles returned error: %v", err)
+	}
+
+	if len(resp.Files) != 1 {
+		t.Fatalf("expected 1 visible file, got %d: %#v", len(resp.Files), resp.Files)
+	}
+
+	if resp.Files[0] != "main.go" {
+		t.Fatalf("unexpected file: got %q want %q", resp.Files[0], "main.go")
+	}
+}
+
+func mustMkdirAll(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) failed: %v", path, err)
+	}
+}
+
+func mustWriteFile(t *testing.T, path string, content string) {
+	t.Helper()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) failed: %v", dir, err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) failed: %v", path, err)
+	}
+}
