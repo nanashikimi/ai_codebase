@@ -54,6 +54,30 @@ func main() {
 		writeJSON(w, 200, resp)
 	})
 
+	http.HandleFunc("/tools/semantic_search", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)// CORS headers
+		if r.Method == http.MethodOptions {//OPTIONS-preflight processing ==>
+			w.WriteHeader(http.StatusNoContent) //==> 204
+			return
+		}
+		if r.Method != http.MethodPost {// MUST be POST ==>
+			writeJSON(w, 405, map[string]string{"error": "POST only"}) //==> Not Allowed
+			return
+		}
+		var req tools.SemanticSearchRequest
+		err := json.NewDecoder(r.Body).Decode(&req)//HTTP-body into JSON
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "invalid json"})
+			return
+		}
+		resp, err := tools.SemanticSearch(req)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, resp)
+	})
+
 	http.HandleFunc("/tools/open_file", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
 		if r.Method == http.MethodOptions {
@@ -120,6 +144,10 @@ func main() {
 				{
 					"name":        "search_code",
 					"description": "Search repository using ripgrep",
+				},
+				{
+					"name":        "semantic_search",
+					"description": "Semantic search repository using embeddings (requires retrieval service)",
 				},
 				{
 					"name":        "open_file",

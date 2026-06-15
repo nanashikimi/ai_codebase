@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,12 +61,25 @@ type Agent struct {
 	RepoRoot  string
 }
 
+func ollamaHTTPTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv("OLLAMA_TIMEOUT_SEC"))
+	if v == "" {
+		return 300 * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 60 || n > 900 {
+		return 300 * time.Second
+	}
+	return time.Duration(n) * time.Second
+}
+
 func NewDefaultAgent(model string) *Agent {
+	tmo := ollamaHTTPTimeout()
 	return &Agent{
 		OllamaURL: "http://127.0.0.1:11434/api/chat",
 		Model:     model,
 		Client: &http.Client{
-			Timeout: 180 * time.Second,
+			Timeout: tmo,
 		},
 		RepoRoot: ".",
 	}
@@ -87,6 +101,7 @@ func (a *Agent) Chat(question string) (string, error) {
 
 	toolsDef := []ToolDef{
 		makeSearchToolDef(),
+		makeSemanticSearchToolDef(),
 		makeOpenFileToolDef(),
 		makeListFilesToolDef(),
 		makeGrepFileToolDef(),
@@ -172,6 +187,20 @@ func (a *Agent) Chat(question string) (string, error) {
 					}
 				}
 
+				if toolName == "search_code" && strings.TrimSpace(getString(tc.Function.Arguments, "query")) == "" {
+					out := `{"error":"search_code requires a non-empty \"query\" argument (ripgrep pattern). Example: ListenAndServe|HandleFunc"}`
+					messages = append(messages, Message{
+						Role:     "tool",
+						ToolName: toolName,
+						Content:  out,
+					})
+					messages = append(messages, Message{
+						Role:    "user",
+						Content: "That search_code call was invalid: missing \"query\". Call search_code again with a non-empty ripgrep query.",
+					})
+					continue
+				}
+
 				out, err := a.executeTool(toolName, tc.Function.Arguments)
 				if err != nil {
 					out = fmt.Sprintf(`{"error":%q}`, err.Error())
@@ -193,7 +222,7 @@ func (a *Agent) Chat(question string) (string, error) {
 						zeroHitSearches = 0
 						haveToolContext = true
 					}
-				} else if toolName == "open_file" || toolName == "list_files" || toolName == "grep_file" {
+				} else if toolName == "semantic_search" || toolName == "open_file" || toolName == "list_files" || toolName == "grep_file" {
 					haveToolContext = true
 				}
 			}
@@ -235,6 +264,27 @@ func (a *Agent) Chat(question string) (string, error) {
 
 		content := strings.TrimSpace(resp.Message.Content)
 		log.Printf("TRIMMED CONTENT: %q", content)
+
+		// Non-code questions: if the model already answered without tools, do not inject unrelated repo context.
+		if !haveToolContext && isOffTopicNonRepoQuestion(question) {
+			if content != "" {
+				return trivialFinalAnswer(content), nil
+			}
+			return "I only answer questions about this codebase using repository tools (search_code, open_file, etc.). Please ask about the repository.", nil
+		}
+
+		// Reject LLM JSON artifacts (follow_ups object or JSON array of questions) — not a grounded code answer.
+		if content != "" && isLLMQuestionListArtifact(content) {
+			invalidFinalAnswers++
+			if invalidFinalAnswers >= 2 {
+				return conciseNoAnswer(), nil
+			}
+			messages = append(messages, Message{
+				Role:    "user",
+				Content: "Do not output JSON or follow-up question lists. Answer using only path:line citations from tool outputs.",
+			})
+			continue
+		}
 
 		if content != "" && haveToolContext {
 			if isNoMatchesAnswer(content) {
@@ -379,11 +429,13 @@ func (a *Agent) forceContextAndContinue(messages *[]Message, question string) ([
 		if h != nil {
 			log.Printf("OPENING FILE: %s at line %d", h.Path, h.Line)
 
-			start := h.Line - 20
+			// Tight window around the chosen hit so CITATIONS (first ~15 lines) usually include the hit line,
+			// especially when the hit is a `func ...` definition.
+			start := h.Line - 8
 			if start < 1 {
 				start = 1
 			}
-			end := h.Line + 40
+			end := h.Line + 28
 
 			openResp, oerr := tools.OpenFile(tools.OpenFileRequest{
 				Path:      h.Path,
@@ -438,7 +490,7 @@ func (a *Agent) callOllama(messages []Message, toolsDef []ToolDef) (*ChatRespons
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ollamaHTTPTimeout())
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", a.OllamaURL, &buf)
@@ -492,6 +544,21 @@ func (a *Agent) executeTool(name string, args map[string]any) (string, error) {
 			req.Root = a.RepoRoot
 		}
 		resp, err := tools.SearchCode(req)
+		if err != nil {
+			return "", err
+		}
+		return mustJSON(resp), nil
+
+	case "semantic_search":
+		req := tools.SemanticSearchRequest{
+			Query: getString(args, "query"),
+			Root:  getString(args, "root"),
+			TopK:  getInt(args, "top_k"),
+		}
+		if req.Root == "" {
+			req.Root = a.RepoRoot
+		}
+		resp, err := tools.SemanticSearch(req)
 		if err != nil {
 			return "", err
 		}

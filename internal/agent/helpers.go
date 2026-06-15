@@ -27,16 +27,74 @@ func appendToolSummary(messages *[]Message, toolName string, toolJSON string) {
 			return
 		}
 
+		hits := sortSearchHitsForSummary(r.Hits)
+
+		max := 8
+		if len(hits) < max {
+			max = len(hits)
+		}
+
+		var b strings.Builder
+		b.WriteString("CITATIONS (copy these exact path:line):\n")
+		for i := 0; i < max; i++ {
+			h := hits[i]
+			fmt.Fprintf(&b, "- %s:%d  %s\n", h.Path, h.Line, h.Text)
+		}
+
+		*messages = append(*messages, Message{
+			Role:    "user",
+			Content: b.String(),
+		})
+
+	case "semantic_search":
+		var r tools.SemanticSearchResponse
+		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
+			*messages = append(*messages, Message{
+				Role:    "user",
+				Content: "CITATIONS: (failed to parse semantic_search output)",
+			})
+			return
+		}
+		if len(r.Hits) == 0 {
+			*messages = append(*messages, Message{
+				Role:    "user",
+				Content: "CITATIONS: (semantic_search returned 0 hits)",
+			})
+			return
+		}
+
 		max := 8
 		if len(r.Hits) < max {
 			max = len(r.Hits)
 		}
 
 		var b strings.Builder
-		b.WriteString("CITATIONS (copy these exact path:line):\n")
+		// Citations MUST be exactly "path:line" per line (no extra text on the citation lines).
+		b.WriteString("CITATIONS\n")
 		for i := 0; i < max; i++ {
 			h := r.Hits[i]
-			fmt.Fprintf(&b, "- %s:%d  %s\n", h.Path, h.Line, h.Text)
+			line := h.StartLine
+			if line <= 0 {
+				line = 1
+			}
+			fmt.Fprintf(&b, "%s:%d\n", h.Path, line)
+		}
+
+		// Extra hints are optional and should not be used as citations.
+		b.WriteString("\nSEMANTIC_HINTS (not for citations):\n")
+		for i := 0; i < max; i++ {
+			h := r.Hits[i]
+			preview := strings.TrimSpace(h.Preview)
+			if preview == "" {
+				preview = strings.TrimSpace(h.Text)
+			}
+			if preview == "" {
+				preview = "preview unavailable"
+			}
+			if len(preview) > 120 {
+				preview = preview[:120] + "..."
+			}
+			fmt.Fprintf(&b, "- %s (score=%.3f): %s\n", h.Path, h.Score, preview)
 		}
 
 		*messages = append(*messages, Message{
@@ -59,15 +117,21 @@ func appendToolSummary(messages *[]Message, toolName string, toolJSON string) {
 			lines = lines[:len(lines)-1]
 		}
 
-		maxLines := 25
+		// Keep tool output small so the LLM can respond faster.
+		maxLines := 15
 		if len(lines) < maxLines {
 			maxLines = len(lines)
 		}
 
 		var b strings.Builder
-		fmt.Fprintf(&b, "OPEN_FILE SNIPPET (copy exact path:line): %s:%d-%d\n",
-			r.Path, r.StartLine, r.StartLine+maxLines-1)
+		// Citations MUST be exactly "path:line" per line (no extra text on the citation lines).
+		b.WriteString("CITATIONS\n")
+		for i := 0; i < maxLines; i++ {
+			ln := r.StartLine + i
+			fmt.Fprintf(&b, "%s:%d\n", r.Path, ln)
+		}
 
+		b.WriteString("\nOPEN_FILE SNIPPET:\n")
 		for i := 0; i < maxLines; i++ {
 			ln := r.StartLine + i
 			fmt.Fprintf(&b, "%s:%d  %s\n", r.Path, ln, lines[i])
@@ -288,6 +352,17 @@ func addKnownPathsFromToolOutput(knownPaths map[string]bool, toolName string, to
 			}
 		}
 
+	case "semantic_search":
+		var r tools.SemanticSearchResponse
+		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
+			return
+		}
+		for _, h := range r.Hits {
+			if h.Path != "" {
+				knownPaths[h.Path] = true
+			}
+		}
+
 	case "open_file":
 		var r tools.OpenFileResponse
 		if err := json.Unmarshal([]byte(toolJSON), &r); err != nil {
@@ -310,42 +385,98 @@ func addKnownPathsFromToolOutput(knownPaths map[string]bool, toolName string, to
 	}
 }
 
-func chooseBestHit(hits []tools.SearchHit) *tools.SearchHit {
-	for i := range hits {
-		if strings.Contains(hits[i].Text, "ListenAndServe") {
-			return &hits[i]
-		}
-	}
+func isSearchHitNoise(h tools.SearchHit) bool {
+	p := strings.ToLower(h.Path)
+	return strings.Contains(p, ".bak") ||
+		strings.HasSuffix(p, "~") ||
+		strings.Contains(p, ".retrieval/")
+}
 
-	for i := range hits {
-		if strings.Contains(hits[i].Text, `"/chat"`) {
-			return &hits[i]
-		}
-	}
+func isGoFuncDefinitionLine(text string) bool {
+	t := strings.TrimSpace(text)
+	// Typical ripgrep match line: "\tfunc Foo(" or "func Foo("
+	return strings.HasPrefix(t, "func ")
+}
 
-	for i := range hits {
-		if strings.HasSuffix(hits[i].Path, ".go") {
-			return &hits[i]
-		}
+// sortSearchHitsForSummary puts likely-definition lines (func ...) first so the model
+// copies better citations from the summary block.
+func sortSearchHitsForSummary(hits []tools.SearchHit) []tools.SearchHit {
+	if len(hits) <= 1 {
+		return hits
 	}
-
-	for i := range hits {
-		if strings.HasPrefix(hits[i].Path, "cmd/") {
-			return &hits[i]
-		}
-	}
-
-	for i := range hits {
-		if strings.HasPrefix(hits[i].Path, "internal/agent/") {
+	var funcHits []tools.SearchHit
+	var rest []tools.SearchHit
+	for _, h := range hits {
+		if isSearchHitNoise(h) {
 			continue
 		}
-		return &hits[i]
+		if strings.HasSuffix(h.Path, ".go") && isGoFuncDefinitionLine(h.Text) {
+			funcHits = append(funcHits, h)
+		} else {
+			rest = append(rest, h)
+		}
+	}
+	out := append(funcHits, rest...)
+	if len(out) == 0 {
+		return hits
+	}
+	return out
+}
+
+func chooseBestHit(hits []tools.SearchHit) *tools.SearchHit {
+	if len(hits) == 0 {
+		return nil
 	}
 
-	if len(hits) > 0 {
-		return &hits[0]
+	filtered := make([]tools.SearchHit, 0, len(hits))
+	for i := range hits {
+		if !isSearchHitNoise(hits[i]) {
+			filtered = append(filtered, hits[i])
+		}
 	}
-	return nil
+	if len(filtered) == 0 {
+		filtered = hits
+	}
+
+	for i := range filtered {
+		if strings.Contains(filtered[i].Text, "ListenAndServe") {
+			return &filtered[i]
+		}
+	}
+
+	for i := range filtered {
+		if strings.Contains(filtered[i].Text, `"/chat"`) {
+			return &filtered[i]
+		}
+	}
+
+	// Prefer a real Go function definition hit (e.g. "func SearchCode(...)") over type/struct lines.
+	for i := range filtered {
+		if strings.HasSuffix(filtered[i].Path, ".go") && isGoFuncDefinitionLine(filtered[i].Text) {
+			return &filtered[i]
+		}
+	}
+
+	for i := range filtered {
+		if strings.HasSuffix(filtered[i].Path, ".go") {
+			return &filtered[i]
+		}
+	}
+
+	for i := range filtered {
+		if strings.HasPrefix(filtered[i].Path, "cmd/") {
+			return &filtered[i]
+		}
+	}
+
+	for i := range filtered {
+		if strings.HasPrefix(filtered[i].Path, "internal/agent/") {
+			continue
+		}
+		return &filtered[i]
+	}
+
+	return &filtered[0]
 }
 
 func conciseNoAnswer() string {
@@ -391,8 +522,53 @@ func getInt(m map[string]any, k string) int {
 	}
 }
 
+func isFollowUpsJSONPayload(s string) bool {
+	t := strings.TrimSpace(s)
+	if !strings.HasPrefix(t, "{") {
+		return false
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(t), &m); err != nil {
+		return false
+	}
+	_, ok := m["follow_ups"]
+	return ok
+}
+
+// isJSONArrayQuestionPayload detects ["question1", "question2", ...] style artifacts.
+func isJSONArrayQuestionPayload(s string) bool {
+	t := strings.TrimSpace(s)
+	if !strings.HasPrefix(t, "[") {
+		return false
+	}
+	var arr []any
+	if err := json.Unmarshal([]byte(t), &arr); err != nil {
+		return false
+	}
+	if len(arr) < 1 || len(arr) > 30 {
+		return false
+	}
+	for _, v := range arr {
+		sv, ok := v.(string)
+		if !ok || strings.TrimSpace(sv) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func isLLMQuestionListArtifact(s string) bool {
+	trim := strings.TrimSpace(s)
+	return isFollowUpsJSONPayload(trim) || isJSONArrayQuestionPayload(trim)
+}
+
 func isFileListAnswer(s string) bool {
-	t := strings.ToLower(strings.TrimSpace(s))
+	trim := strings.TrimSpace(s)
+	// Model sometimes emits JSON with follow-up questions; do not treat as a file list.
+	if isLLMQuestionListArtifact(trim) {
+		return false
+	}
+	t := strings.ToLower(trim)
 	return strings.Contains(t, "the following files") ||
 		strings.Contains(t, "contains the following files") ||
 		strings.Contains(t, "files within") ||

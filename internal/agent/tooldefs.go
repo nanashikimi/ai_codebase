@@ -75,3 +75,29 @@ func makeGrepFileToolDef() ToolDef {
 	}
 	return t
 }
+
+func makeSemanticSearchToolDef() ToolDef {
+	var t ToolDef
+	t.Type = "function"
+	t.Function.Name = "semantic_search"
+	t.Function.Description = "Semantic search over repository files using embeddings. Returns top matching file chunks with line ranges."
+	t.Function.Parameters = map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{
+				"type":        "string",
+				"description": "Natural language query describing what you're looking for.",
+			},
+			"root": map[string]any{
+				"type":        "string",
+				"description": "Optional root directory relative to repo root. Defaults to repo root.",
+			},
+			"top_k": map[string]any{
+				"type":        "integer",
+				"description": "Number of results to return.",
+			},
+		},
+		"required": []string{"query"},
+	}
+	return t
+}

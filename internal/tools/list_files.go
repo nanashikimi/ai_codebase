@@ -45,6 +45,7 @@ func ListFiles(req ListFilesRequest) (ListFilesResponse, error) {
 		"dist":         true,
 		"build":        true,
 		".venv":        true,
+		".retrieval":   true,
 	}
 
 	err := filepath.WalkDir(clean, func(path string, d fs.DirEntry, err error) error {

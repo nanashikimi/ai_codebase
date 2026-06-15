@@ -50,6 +50,8 @@ func SearchCode(req SearchCodeRequest) (SearchCodeResponse, error) {
 		"--glob", "!**/dist/*",
 		"--glob", "!**/build/*",
 		"--glob", "!**/.venv/*",
+		"--glob", "!**/.retrieval/*",
+		"--glob", "!**/*.bak",
 		"--glob", "!internal/agent/*",
 		"--glob", "!prompts/*",
 		"--glob", "!examples/*",
